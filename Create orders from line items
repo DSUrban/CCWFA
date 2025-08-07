@@ -1,0 +1,132 @@
+const axios = require('axios');
+
+exports.main = async (event, callback) => {
+  const HUBSPOT_API_KEY = process.env.LineItems_to_Orders_key;
+  const dealId = event.inputFields['hs_object_id'];
+
+  if (!dealId) {
+    callback({
+      outputFields: {
+        error: 'Missing hs_object_id in inputFields. Cannot proceed.',
+        orders: '[]'
+      }
+    });
+    return;
+  }
+
+  const today = new Date();
+  const todayStr = `${today.getMonth() + 1}-${today.getDate()}-${today.getFullYear()}`;
+
+  const ORDER_PIPELINE_ID = '14a2e10e-5471-408a-906e-c51f3b04369e';
+  const ORDER_STAGE_ID = '3725360f-519b-4b18-a593-494d60a29c9f';
+
+  try {
+    console.log(`🔍 Deal ID: ${dealId}`);
+
+    const dealRes = await axios.get(`https://api.hubapi.com/crm/v3/objects/deals/${dealId}`, {
+      headers: { Authorization: `Bearer ${HUBSPOT_API_KEY}` }
+    });
+    const dealName = dealRes.data.properties.dealname || 'Unnamed Deal';
+    console.log(`✅ Deal Name: ${dealName}`);
+
+    const lineItemsRes = await axios.get(
+      `https://api.hubapi.com/crm/v4/objects/deals/${dealId}/associations/line_items`,
+      { headers: { Authorization: `Bearer ${HUBSPOT_API_KEY}` } }
+    );
+    const lineItemIds = lineItemsRes.data.results.map(item => item.toObjectId);
+    console.log(`📦 Line Item IDs:`, lineItemIds);
+
+    const createdOrders = [];
+
+    for (const lineItemId of lineItemIds) {
+      console.log(`➡️ Processing Line Item: ${lineItemId}`);
+
+      const lineItemRes = await axios.get(
+        `https://api.hubapi.com/crm/v3/objects/line_items/${lineItemId}?properties=hs_recurring_billing_period,amount,quantity,recurringbillingfrequency,hs_recurring_billing_start_date,hs_recurring_billing_end_date,hs_acv,hs_arr,hs_mrr`,
+        { headers: { Authorization: `Bearer ${HUBSPOT_API_KEY}` } }
+      );
+
+      const props = lineItemRes.data.properties;
+      const amount = parseFloat(props.amount || 0).toFixed(2);
+      const currency = props.hs_currency_code || 'USD';
+      const billingPeriod = props.hs_recurring_billing_period;
+
+      // Default to 0 (One-Time)
+      let term = 0;
+
+      // Parse ISO 8601 format (e.g., "P3M")
+      if (billingPeriod && /^P(\d+)M$/.test(billingPeriod)) {
+        const match = billingPeriod.match(/^P(\d+)M$/);
+        term = parseInt(match[1], 10);
+      }
+      const billDate = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+
+      console.log(`  ℹ️ billing_period: ${billingPeriod}, term (months): ${term}, amount: ${amount}`);
+
+      if (!term || isNaN(term)) {
+        // One-Time order
+        const orderPayload = {
+          properties: {
+            hs_order_name: `${dealName} | One-Time | ${amount}`,
+            hs_pipeline: ORDER_PIPELINE_ID,
+            hs_pipeline_stage: ORDER_STAGE_ID,
+            hs_currency_code: currency,
+            hs_total_price: amount,
+            billing_date: billDate 
+          }
+        };
+
+        const orderRes = await axios.post(
+          `https://api.hubapi.com/crm/v3/objects/order`,
+          orderPayload,
+          { headers: { Authorization: `Bearer ${HUBSPOT_API_KEY}` } }
+        );
+
+        console.log(`✅ Created One-Time order: ${orderRes.data.id}`);
+        createdOrders.push(orderRes.data);
+      } else {
+        // Create MRR orders for each month
+        for (let i = 0; i < term; i++) {
+          const billDate = new Date(today.getFullYear(), today.getMonth() + i, today.getDate());
+          const billDateStr = `${billDate.getMonth() + 1}-${billDate.getDate()}-${billDate.getFullYear()}`;
+
+          const orderPayload = {
+            properties: {
+              hs_order_name: `${dealName} | MRR | ${amount}`,
+              hs_pipeline: ORDER_PIPELINE_ID,
+              hs_pipeline_stage: ORDER_STAGE_ID,
+              hs_currency_code: currency,
+              hs_total_price: amount,
+              billing_date: billDate
+            }
+          };
+
+          const orderRes = await axios.post(
+            `https://api.hubapi.com/crm/v3/objects/order`,
+            orderPayload,
+            { headers: { Authorization: `Bearer ${HUBSPOT_API_KEY}` } }
+          );
+
+          console.log(`✅ Created MRR order for ${billDateStr}: ${orderRes.data.id}`);
+          createdOrders.push(orderRes.data);
+        }
+      }
+    }
+
+    console.log(`🎉 Total orders created: ${createdOrders.length}`);
+    callback({
+      outputFields: {
+        orders: JSON.stringify(createdOrders)
+      }
+    });
+
+  } catch (err) {
+    console.error('💥 Fatal error:', err.response?.data || err.message);
+    callback({
+      outputFields: {
+        error: err.message,
+        orders: '[]'
+      }
+    });
+  }
+};
